@@ -95,3 +95,107 @@ def test_bad_bytes_never_a_duplicate():
     assert sc.dhash(b"not an image") is None
     # None candidate must never be skipped (anti-false-skip).
     assert sc.is_duplicate_hash(None, [123, 456]) is False
+
+
+def test_stale_entries_only_names_no_longer_present():
+    from custom_components.samsungtv_smart.api import _upload_sidecar as sc
+
+    sidecar = {
+        "keep.jpg": {"content_id": "MY_F0001", "modified": 1.0},
+        "gone.jpg": {"content_id": "MY_F0002", "modified": 1.0},
+    }
+    assert sc.stale_entries(sidecar, {"keep.jpg", "new.jpg"}) == ["gone.jpg"]
+    assert sc.stale_entries({}, {"a.jpg"}) == []
+
+
+# ── upload_batch(prune=True) ────────────────────────────────────────────────
+
+
+class _Hass:
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+class _FakeArt:
+    """Just enough of SamsungTVAsyncArt for upload_batch."""
+
+    def __init__(self, fail_delete=False):
+        import logging
+
+        self._log = logging.getLogger("test")
+        self.next_id = 100
+        self.deleted: list[list[str]] = []
+        self.fail_delete = fail_delete
+
+    async def upload(self, path, **_):
+        self.next_id += 1
+        return f"MY_F{self.next_id:04d}"
+
+    async def delete_list(self, content_ids):
+        if self.fail_delete:
+            raise ConnectionError("tv went away")
+        self.deleted.append(list(content_ids))
+        return True
+
+
+async def _batch(art, folder, **kwargs):
+    from custom_components.samsungtv_smart.api import _upload_sidecar as sc
+    from custom_components.samsungtv_smart.api.art import SamsungTVAsyncArt
+
+    return await SamsungTVAsyncArt.upload_batch(
+        art,
+        sc.list_images(str(folder)),
+        hass=_Hass(),
+        throttle=0,
+        sidecar_path=str(folder / ".samsungtv_upload.json"),
+        **kwargs,
+    )
+
+
+async def test_prune_deletes_removed_and_replaced_art(tmp_path):
+    from custom_components.samsungtv_smart.api import _upload_sidecar as sc
+
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    (tmp_path / "b.jpg").write_bytes(b"b")
+    art = _FakeArt()
+    first = await _batch(art, tmp_path, prune=True)
+    assert first["uploaded"] == ["MY_F0101", "MY_F0102"]
+    assert first["deleted"] == []
+
+    # b.jpg leaves the folder, a.jpg is edited
+    (tmp_path / "b.jpg").unlink()
+    os.utime(tmp_path / "a.jpg", (5000, 5000))
+    second = await _batch(art, tmp_path, prune=True)
+    assert second["uploaded"] == ["MY_F0103"]
+    assert sorted(second["deleted"]) == ["MY_F0101", "MY_F0102"]
+    assert sc.load_sidecar(str(tmp_path / ".samsungtv_upload.json")) == {
+        "a.jpg": {"content_id": "MY_F0103", "modified": 5000.0}
+    }
+
+
+async def test_without_prune_nothing_is_deleted(tmp_path):
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    art = _FakeArt()
+    await _batch(art, tmp_path)
+    (tmp_path / "a.jpg").unlink()
+    result = await _batch(art, tmp_path)
+    assert result["deleted"] == []
+    assert art.deleted == []
+
+
+async def test_prune_failed_delete_is_retried_next_run(tmp_path):
+    from custom_components.samsungtv_smart.api import _upload_sidecar as sc
+
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    await _batch(_FakeArt(), tmp_path, prune=True)
+    (tmp_path / "a.jpg").unlink()
+
+    result = await _batch(_FakeArt(fail_delete=True), tmp_path, prune=True)
+    assert result["deleted"] == []
+    # Still recorded, so the next run tries again
+    assert "a.jpg" in sc.load_sidecar(str(tmp_path / ".samsungtv_upload.json"))
+
+    art = _FakeArt()
+    result = await _batch(art, tmp_path, prune=True)
+    assert result["deleted"] == ["MY_F0101"]
+    assert sc.load_sidecar(str(tmp_path / ".samsungtv_upload.json")) == {}

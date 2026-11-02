@@ -534,6 +534,7 @@ async def async_setup_entry(
             ),
             vol.Optional("skip_unchanged", default=True): cv.boolean,
             vol.Optional("dedup", default=False): cv.boolean,
+            vol.Optional("prune", default=False): cv.boolean,
         },
         "async_art_upload_batch",
         supports_response=SupportsResponse.OPTIONAL,
@@ -5816,6 +5817,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         throttle: float = 2.0,
         skip_unchanged: bool = True,
         dedup: bool = False,
+        prune: bool = False,
     ) -> dict:
         """Upload every image in a folder, cheaply and idempotently.
 
@@ -5824,11 +5826,18 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         batches complete instead of failing partway through. With ``dedup``,
         also skip a candidate that perceptually matches art already on the TV
         (compared against the downloaded thumbnails), robust to the TV's
-        re-encode, with a strict anti-false-skip threshold.
+        re-encode, with a strict anti-false-skip threshold. With ``prune``,
+        art this folder uploaded whose file has since been removed (or
+        replaced) is deleted from the TV, so the TV mirrors the folder.
         """
         import os
 
-        self._log.info("Frame Art: batch upload from %s (dedup=%s)", folder, dedup)
+        self._log.info(
+            "Frame Art: batch upload from %s (dedup=%s, prune=%s)", folder, dedup, prune
+        )
+        # Pruning needs the sidecar: it is the record of what this folder uploaded.
+        if prune and not skip_unchanged:
+            return {"error": "prune requires skip_unchanged"}
 
         if not await self._ensure_frame_tv_check():
             return {"error": "Frame TV not supported"}
@@ -5842,7 +5851,8 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         if not is_dir:
             return {"error": f"Folder not found: {folder}"}
         files = await self.hass.async_add_executor_job(list_images, folder)
-        if not files:
+        # An emptied folder still has to be pruned.
+        if not files and not prune:
             return {"uploaded": [], "skipped": 0, "failed": [], "note": "no images"}
 
         # Per-folder sidecar (hidden; excluded from the *.jpg gallery filter).
@@ -5864,6 +5874,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             sidecar_path=sidecar_path,
             dedup_dir=dedup_dir,
             panel=self._art_panel_size(),
+            prune=prune,
         )
 
         # Reflect the new art and fetch the (delayed) TV-side thumbnails.
@@ -5872,11 +5883,13 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
                 self.hass.async_create_task(self._retry_new_thumbnail(content_id))
 
         self._log.info(
-            "Frame Art: batch upload from %s — %d uploaded, %d skipped, %d failed",
+            "Frame Art: batch upload from %s — %d uploaded, %d skipped, %d failed, "
+            "%d deleted",
             folder,
             len(result.get("uploaded", [])),
             result.get("skipped", 0),
             len(result.get("failed", [])),
+            len(result.get("deleted", [])),
         )
         return result
 

@@ -255,6 +255,17 @@ art_upload_batch:
       default: false
       selector:
         boolean:
+    prune:
+      name: Delete removed files from the TV
+      description: >-
+        Make the TV mirror the folder: art this folder uploaded whose file was
+        removed (or replaced by a newer version) is deleted from the TV. Only
+        art uploaded from this folder is ever deleted. Requires Skip unchanged
+        files.
+      required: false
+      default: false
+      selector:
+        boolean:
 
 art_delete:
   name: Delete Artwork

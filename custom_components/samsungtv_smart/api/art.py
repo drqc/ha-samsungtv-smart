@@ -3045,6 +3045,7 @@ class SamsungTVAsyncArt:
         sidecar_path: str | None = None,
         dedup_dir: str | None = None,
         panel: tuple[int, int] | None = None,
+        prune: bool = False,
     ) -> dict:
         """Upload a list of image files, cheaply and idempotently.
 
@@ -3058,10 +3059,15 @@ class SamsungTVAsyncArt:
           false skips (a photo silently never uploading) out.
         - **Throttle**: uploads are spaced ``throttle`` seconds apart. Large
           batches (>~25) reliably fail partway through without this pacing.
+        - **Prune (opt-in, needs the sidecar)**: the folder becomes the source
+          of truth. Art this folder uploaded whose file is gone is deleted
+          from the TV, and the previous copy of a changed file is deleted once
+          its replacement is up. Only content_ids recorded in the sidecar are
+          ever deleted.
 
         All filesystem access runs in the executor. Returns
         ``{"uploaded": [...], "skipped": n, "skipped_duplicate": n,
-        "failed": [...]}``.
+        "failed": [...], "deleted": [...]}``.
         """
         from . import _upload_sidecar as sc
 
@@ -3083,6 +3089,9 @@ class SamsungTVAsyncArt:
         skipped = 0
         skipped_dup = 0
         did_upload = False
+        # content_ids to delete when pruning: removed files, replaced copies
+        stale_ids: list[str] = []
+        prune = prune and bool(sidecar_path)
 
         for path in files:
             name = os.path.basename(path)
@@ -3115,28 +3124,56 @@ class SamsungTVAsyncArt:
             content_id = await self.upload(path, matte=matte, hass=hass, panel=panel)
             if content_id:
                 uploaded.append(content_id)
+                previous = sidecar.get(name, {}).get("content_id")
+                if prune and previous and previous != content_id:
+                    stale_ids.append(previous)
                 sidecar[name] = {"content_id": content_id, "modified": mtime}
                 if candidate_hash is not None:
                     ref_hashes.append(candidate_hash)  # catch within-batch dupes
             else:
                 failed.append(path)
 
+        deleted: list[str] = []
+        if prune:
+            present = {os.path.basename(path) for path in files}
+            removed = sc.stale_entries(sidecar, present)
+            for name in removed:
+                if content_id := sidecar[name].get("content_id"):
+                    stale_ids.append(content_id)
+            if stale_ids:
+                try:
+                    await self.delete_list(stale_ids)
+                    deleted = stale_ids
+                except Exception as ex:  # noqa: BLE001 - uploads already succeeded
+                    self._log.warning(
+                        "Art API: batch upload could not delete %d pruned "
+                        "artwork(s): %s",
+                        len(stale_ids),
+                        ex,
+                    )
+                    # Keep removed files in the sidecar so the next run retries
+                    removed = []
+            for name in removed:
+                sidecar.pop(name, None)
+
         if sidecar_path and hass is not None:
             await hass.async_add_executor_job(sc.save_sidecar, sidecar_path, sidecar)
 
         self._log.info(
             "Art API: batch upload done — %d uploaded, %d skipped, "
-            "%d duplicate, %d failed",
+            "%d duplicate, %d failed, %d deleted",
             len(uploaded),
             skipped,
             skipped_dup,
             len(failed),
+            len(deleted),
         )
         return {
             "uploaded": uploaded,
             "skipped": skipped,
             "skipped_duplicate": skipped_dup,
             "failed": failed,
+            "deleted": deleted,
         }
 
     async def delete(self, content_id: str) -> bool:

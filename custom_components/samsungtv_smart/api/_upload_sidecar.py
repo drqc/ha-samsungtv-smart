@@ -79,6 +79,16 @@ def needs_upload(filename: str, mtime: float, sidecar: dict) -> bool:
     return entry.get("modified") != mtime
 
 
+def stale_entries(sidecar: dict, present: set[str]) -> list[str]:
+    """Names in the sidecar whose file is no longer in the folder.
+
+    Used by the batch upload's ``prune``: only art this folder uploaded (and
+    recorded) is ever a candidate, so pruning can't touch anything else on
+    the TV.
+    """
+    return sorted(name for name in sidecar if name not in present)
+
+
 # ── Perceptual dedup (opt-in) ──────────────────────────────────────────────
 
 
